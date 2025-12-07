@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
+import logging
+logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
@@ -143,12 +145,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
         # Fused gate_up_proj (column parallel)
-        w13_weight_n, w13_weight_k = 2 * intermediate_size, hidden_size
+        w13_weight_n, w13_weight_k = 2 * intermediate_size_per_partition, hidden_size
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
@@ -161,7 +163,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # down_proj (row parallel)
         w2_weight_n, w2_weight_k = (
             hidden_size,
-            intermediate_size,
+            intermediate_size_per_partition,
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n

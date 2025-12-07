@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import torch
 from packaging import version as pkg_version
 
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -20,9 +21,14 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.moe.kt_ep_wrapper import (
+    KTEPWrapperMethod,
+    create_kt_config_from_server_args,
+)
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -148,16 +154,21 @@ class FusedMoE(torch.nn.Module):
             not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
         )
 
-        if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels
-            )
+        self.quant_method: Optional[FusedMoEMethodBase] = None
+        server_args = get_global_server_args()
+        kt_config = create_kt_config_from_server_args(server_args, layer_id)
+        if kt_config is not None:
+            if quant_config is not None:
+                gpu_method = quant_config.get_quant_method(self, prefix)
+            else:
+                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
-            self.quant_method = quant_config.get_quant_method(self, prefix)
-            if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
-                self.quant_method.enable_flashinfer_cutlass_moe = (
-                    self.enable_flashinfer_cutlass_moe
-                )
+            if quant_config is not None:
+                self.quant_method = quant_config.get_quant_method(self, prefix)
+            if self.quant_method is None:
+                self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+
         assert self.quant_method is not None
 
         self.quant_config = quant_config
@@ -166,7 +177,6 @@ class FusedMoE(torch.nn.Module):
             num_experts=self.num_local_experts,
             hidden_size=hidden_size,
             # FIXME: figure out which intermediate_size to use
-            intermediate_size=self.intermediate_size_per_partition,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
@@ -430,6 +440,12 @@ class FusedMoE(torch.nn.Module):
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
             return
+
+        if isinstance(self.quant_method, KTEPWrapperMethod):
+            if self.quant_method.num_gpu_experts != -1:
+                if expert_id >= self.quant_method.num_gpu_experts:
+                    return
+
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,
@@ -449,13 +465,17 @@ class FusedMoE(torch.nn.Module):
 
         tp_rank = self.moe_tp_rank
 
+        method = self.quant_method
+        if method.__class__.__name__ == "KTEPWrapperMethod":
+            method = method.gpu_method
+
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                self.quant_method.__class__.__name__
+                method.__class__.__name__
                 == "CompressedTensorsWNA16MoEMethod"
             )
             else loaded_weight

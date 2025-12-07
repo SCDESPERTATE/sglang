@@ -98,7 +98,10 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -209,6 +212,9 @@ class ModelRunner:
 
         if server_args.show_time_cost:
             enable_show_time_cost()
+
+        # Set the global server_args in the scheduler process
+        set_global_server_args_for_scheduler(server_args)
 
         # Global vars
         global_server_args_dict.update(

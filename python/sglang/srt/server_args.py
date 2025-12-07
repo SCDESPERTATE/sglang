@@ -202,6 +202,14 @@ class ServerArgs:
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
 
+    # Ktransformers/AMX expert parallelism
+    kt_weight_path: Optional[str] = None
+    kt_method: Optional[str] = None
+    kt_cpuinfer: Optional[int] = None
+    kt_threadpool_count: Optional[int] = None
+    kt_num_gpu_experts: Optional[int] = None
+    kt_max_deferred_experts_per_token: Optional[int] = None
+
     # Double Sparsity
     enable_double_sparsity: bool = False
     ds_channel_config_path: Optional[str] = None
@@ -1528,6 +1536,41 @@ class ServerArgs:
             help="The storage backend for hierarchical KV cache.",
         )
 
+        # Ktransformer server args
+        parser.add_argument(
+            "--kt-weight-path",
+            type=str,
+            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--kt-method",
+            type=str,
+            default="AMXINT4",
+            help="[ktransformers parameter] Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--kt-cpuinfer",
+            type=int,
+            help="[ktransformers parameter] The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--kt-threadpool-count",
+            type=int,
+            default=2,
+            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-num-gpu-experts",
+            type=int,
+            help="[ktransformers parameter] The number of GPU experts.",
+        )
+        parser.add_argument(
+            "--kt-max-deferred-experts-per-token",
+            type=int,
+            default=ServerArgs.kt_max_deferred_experts_per_token,
+            help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
+
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
@@ -2079,6 +2122,23 @@ class ServerArgs:
             f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
         )
 
+# NOTE: This is a global variable to hold the server args for scheduler.
+_global_server_args: Optional[ServerArgs] = None
+
+
+def set_global_server_args_for_scheduler(server_args: ServerArgs):
+    global _global_server_args
+    _global_server_args = server_args
+
+
+set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
+
+
+def get_global_server_args() -> ServerArgs:
+    if _global_server_args is None:
+        raise ValueError("Global server args is not set yet!")
+
+    return _global_server_args
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
