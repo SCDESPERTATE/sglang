@@ -113,7 +113,7 @@ def create_kt_config_from_server_args(
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
+def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int, is_gpu: bool) -> torch.Tensor:
     """Mask CPU expert IDs by setting them to -1.
 
     This function masks expert IDs that should be computed on CPU (IDs >= num_gpu_experts)
@@ -127,7 +127,19 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     Returns:
         Modified topk_ids tensor with CPU expert IDs masked as -1
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
+    if is_gpu:
+        topk_ids[topk_ids >= num_gpu_experts] = -1
+    else:
+        topk_ids[topk_ids < num_gpu_experts] = -1
+    return topk_ids
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def mask_expert_ids_selected(topk_ids: torch.Tensor, mask: torch.Tensor, is_gpu: bool) -> torch.Tensor:
+    if is_gpu:
+        topk_ids[~mask] = -1
+    else:
+        topk_ids[mask] = -1
+    
     return topk_ids
 
 _SHARED_FULL_CONTEXT = None
@@ -353,9 +365,9 @@ class SharedFullContext:
                 w2_weight_buf.numel() // 2
             )
 
-            def submit_write_expert(expert_id):
-                # Use expert_id % 2 for double buffering slot selection
-                slot = expert_id % 2
+            def submit_write_expert(idx, expert_id):
+                # Use idx % 2 for double buffering slot selection
+                slot = idx % 2
                 w13_weight_ptrs = [
                     ptr + slot * w13_weight_expert_nbytes
                     for ptr in self.all_rank_buffer_ptrs["w13_weight"]
@@ -380,20 +392,21 @@ class SharedFullContext:
                 )
 
             # Submit expert 0 ahead of time
-            submit_write_expert(0)
+            submit_write_expert(0, wrapper.topk_idx[0])
 
-        for e in range(num_experts):
+        nr_xfer_experts = len(wrapper.topk_idx)
+        for e in range(nr_xfer_experts):
             # Sync write for expert e, submit write for expert e+1
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
-                if e + 1 < num_experts:
+                if e + 1 < nr_xfer_experts:
                     # Before writing to slot (e+1)%2, ensure copy from that slot is complete.
 
                     # Since (e+1)%2 == (e-1)%2 for e >= 1, we need to wait for copy(e-1).
                     if e > 0:
                         events[e - 1].synchronize()
 
-                    submit_write_expert(e + 1)
+                    submit_write_expert(e + 1, wrapper.topk_idx[e + 1])
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
@@ -403,10 +416,10 @@ class SharedFullContext:
                 slot = e % 2  # Double buffering
                 for cpu_buf, gpu_t, gpu_tmp_buf in weight_infos:
                     gpu_tmp_buf.copy_(cpu_buf[slot], non_blocking=True)
-                    if gpu_t[e].is_contiguous() and gpu_tmp_buf.is_contiguous():
+                    if gpu_t[wrapper.topk_idx[e]].is_contiguous() and gpu_tmp_buf.is_contiguous():
                         KTransformersOps.dequantize_q4_k(
                             gpu_tmp_buf.data_ptr(),
-                            gpu_t[e].data_ptr(),
+                            gpu_t[wrapper.topk_idx[e]].data_ptr(),
                             gpu_tmp_buf.shape[0],
                             144,
                             256,
@@ -425,8 +438,8 @@ class SharedFullContext:
 
         # Process last expert
         with torch.cuda.stream(post_stream):
-            post_stream.wait_event(events[-1])
-            postprocess_expert(num_experts - 1)
+            post_stream.wait_event(events[nr_xfer_experts - 1])
+            postprocess_expert(nr_xfer_experts - 1)
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
@@ -678,58 +691,61 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
 
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        expert_ids = topk_output.topk_ids
+        gpu_expert_ids: torch.Tensor = expert_ids.clone()
+        cpu_expert_ids: torch.Tensor = expert_ids.clone()
+        topk_idx: torch.Tensor = None
         
-        # Check for full GPU fallback
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
         ):
-            ctx = self._build_full_context(layer)
+            expert_ids_cnt = torch.bincount(expert_ids.view(-1))
 
-            t_compute = time.perf_counter()
-            result = ctx.gpu_method.apply(
+            topk_idx = torch.topk(expert_ids_cnt, k=min(20, expert_ids_cnt.size(0))).indices
+            topk_mask = torch.isin(expert_ids, topk_idx)
+
+            gpu_expert_ids = mask_expert_ids_selected(gpu_expert_ids, topk_mask, is_gpu=True)
+            cpu_expert_ids = mask_expert_ids_selected(cpu_expert_ids, topk_mask, is_gpu=False)
+        else:
+            gpu_expert_ids = mask_cpu_expert_ids(gpu_expert_ids, self.num_gpu_experts, is_gpu=True)
+            cpu_expert_ids = mask_cpu_expert_ids(cpu_expert_ids, self.num_gpu_experts, is_gpu=False)
+
+        cpu_topk_output = topk_output._replace(topk_ids=cpu_expert_ids)
+        # Step 1: Submit CPU expert computation (non-blocking)
+        if self.tp_rank == 0:
+            self.submit(x, cpu_topk_output)
+
+        # Step 2: Prepare GPU computation by masking CPU expert IDs
+        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+        gpu_topk_output = topk_output._replace(topk_ids=gpu_expert_ids)
+        
+        # Step 3: Execute GPU expert computation (any quantization method)
+        # This runs in parallel with CPU computation
+        if topk_idx is not None:
+            self.wrapper.topk_idx = topk_idx
+            ctx = self._build_full_context(layer)
+            gpu_combine_input = ctx.gpu_method.apply(
                 ctx.gpu_layer,
                 x=x,
-                topk_output=topk_output,
+                topk_output=gpu_topk_output,
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 inplace=inplace,
                 no_combine=no_combine,
                 routed_scaling_factor=routed_scaling_factor,
             )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-            t_compute = (time.perf_counter() - t_compute) * 1000
-            if self.tp_rank == 0:
-                logger.info(f"KT fallback: layer {self.kt_config.layer_idx} compute = {t_compute:.2f} ms ")
-
-            return result
-
-        # Step 1: Submit CPU expert computation (non-blocking)
-        if self.tp_rank == 0:
-            self.submit(x, topk_output)
-
-        # Step 2: Prepare GPU computation by masking CPU expert IDs
-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-        topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
-
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        
-        # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(
-            layer=layer,
-            x=x,
-            topk_output=masked_topk_output,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            inplace=inplace,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        else:
+            gpu_combine_input = self.gpu_method.apply(
+                layer=layer,
+                x=x,
+                topk_output=gpu_topk_output,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                inplace=inplace,
+                no_combine=no_combine,
+                routed_scaling_factor=routed_scaling_factor,
+            )
 
         # Step 4: Synchronize CPU results and merge with GPU results
         output = gpu_combine_input
