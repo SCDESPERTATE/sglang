@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 try:
-    from kt_kernel import KTMoEWrapper
+    from kt_kernel import KTMoEWrapper, GGMLQuantizationType, GGML_QUANT_SIZES
     import KTransformersOps
 
     KTRANSFORMERS_AVAILABLE = True
@@ -252,7 +252,9 @@ class SharedFullContext:
             gpu_tensor = getattr(self.gpu_layer, name)
             # Only allocate 2 experts worth of buffer (double buffering)
             expert_nbytes = (
-                gpu_tensor.numel() // num_experts * 144 // 256 #FIXME: Q4_K only
+                gpu_tensor.numel() // num_experts *
+                GGML_QUANT_SIZES[GGMLQuantizationType.Q6_K][1] //
+                GGML_QUANT_SIZES[GGMLQuantizationType.Q6_K][0] #FIXME: Q6_K only
             )
             double_buf_nbytes = expert_nbytes * 2
 
@@ -321,6 +323,10 @@ class SharedFullContext:
         return all_rank_ptrs
 
     def _prepare_weight(self, wrapper):
+        nr_xfer_experts = len(wrapper.topk_idx)
+        if nr_xfer_experts == 0:
+            return
+
         # Bind Python thread to specific CPU core (last cores for each rank)
         tp_rank = get_tensor_model_parallel_rank()
         num_cpus = os.cpu_count()
@@ -394,7 +400,6 @@ class SharedFullContext:
             # Submit expert 0 ahead of time
             submit_write_expert(0, wrapper.topk_idx[0])
 
-        nr_xfer_experts = len(wrapper.topk_idx)
         for e in range(nr_xfer_experts):
             # Sync write for expert e, submit write for expert e+1
             if do_write:
@@ -414,19 +419,34 @@ class SharedFullContext:
 
             with torch.cuda.stream(copy_stream):
                 slot = e % 2  # Double buffering
-                for cpu_buf, gpu_t, gpu_tmp_buf in weight_infos:
+                for i, (cpu_buf, gpu_t, gpu_tmp_buf) in enumerate(weight_infos):
+                    name = self.WEIGHT_NAMES[i]
                     gpu_tmp_buf.copy_(cpu_buf[slot], non_blocking=True)
                     if gpu_t[wrapper.topk_idx[e]].is_contiguous() and gpu_tmp_buf.is_contiguous():
-                        KTransformersOps.dequantize_q4_k(
+                        if name == 'w13_weight':
+                            quant_type = wrapper.gate_type
+                        else:
+                            quant_type = wrapper.down_type
+
+                        ele_per_blk, size_per_blk = GGML_QUANT_SIZES[quant_type]
+                        dequant_fn = None
+                        if quant_type == GGMLQuantizationType.Q6_K:
+                            dequant_fn = KTransformersOps.dequantize_q6_k
+                        elif quant_type == GGMLQuantizationType.Q4_K:
+                            dequant_fn = KTransformersOps.dequantize_q4_k
+                        else:
+                            raise ValueError(f"Unsupported quantization type: {quant_type}")
+
+                        dequant_fn(
                             gpu_tmp_buf.data_ptr(),
                             gpu_t[wrapper.topk_idx[e]].data_ptr(),
-                            gpu_tmp_buf.shape[0],
-                            144,
-                            256,
+                            gpu_t[wrapper.topk_idx[e]].numel() * size_per_blk // ele_per_blk,
+                            size_per_blk,
+                            ele_per_blk,
                             torch.float16,
                         )
                     else:
-                        logging.error(f'gpu[{e}] or gpu_tmp_buf is not contiguous in memory')
+                        logger.error(f'gpu[{e}] or gpu_tmp_buf is not contiguous in memory')
 
                 events[e].record(copy_stream)
 
@@ -702,7 +722,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ):
             expert_ids_cnt = torch.bincount(expert_ids.view(-1))
 
-            topk_idx = torch.topk(expert_ids_cnt, k=min(20, expert_ids_cnt.size(0))).indices
+            topk_idx = torch.topk(expert_ids_cnt, k=min(30, expert_ids_cnt.size(0))).indices
             topk_mask = torch.isin(expert_ids, topk_idx)
 
             gpu_expert_ids = mask_expert_ids_selected(gpu_expert_ids, topk_mask, is_gpu=True)
