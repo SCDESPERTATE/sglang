@@ -196,7 +196,7 @@ async def async_request_openai_completions(
             "model": request_func_input.model,
             "prompt": prompt,
             "temperature": 0.0,
-            "best_of": 1,
+            #"best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
@@ -1020,17 +1020,22 @@ def sample_random_requests(
     random_sample: bool = True,
     return_text: bool = True,
 ) -> List[DatasetRow]:
-    input_lens = np.random.randint(
-        max(int(input_len * range_ratio), 1),
-        input_len + 1,
-        size=num_prompts,
-    )
+    # input_lens = np.random.randint(
+    #     max(int(input_len * range_ratio), 1),
+    #     input_len + 1,
+    #     size=num_prompts,
+    # )
+    input_lens = np.array([38, 236, 909, 73, 768, 906, 716, 646, 848, 961, 145, 130, 973, 584, 
+                            750, 509, 391, 282, 179, 277, 255, 358, 915, 469, 908, 253, 491, 669, 
+                            926, 399, 563, 581, 216, 984, 1002, 754, 504, 479, 865, 87, 142, 1002, 
+                            394, 8, 320, 830, 535, 314, 514, 897])
     output_lens = np.random.randint(
         int(output_len * range_ratio),
         output_len + 1,
         size=num_prompts,
     )
 
+    #print(input_lens)
     if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 

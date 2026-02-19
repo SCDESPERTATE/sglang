@@ -153,6 +153,8 @@ class SharedFullContext:
     ):
         self._build_layers(layer, init_args, global_num_experts)
 
+        self.topk_idx = None
+
         # Capture original tensors to support restoration before loading
         self.original_params = {
             name: param for name, param in self.gpu_layer.named_parameters()
@@ -323,7 +325,7 @@ class SharedFullContext:
         return all_rank_ptrs
 
     def _prepare_weight(self, wrapper):
-        nr_xfer_experts = len(wrapper.topk_idx)
+        nr_xfer_experts = len(self.topk_idx)
         if nr_xfer_experts == 0:
             return
 
@@ -398,7 +400,7 @@ class SharedFullContext:
                 )
 
             # Submit expert 0 ahead of time
-            submit_write_expert(0, wrapper.topk_idx[0])
+            submit_write_expert(0, self.topk_idx[0])
 
         for e in range(nr_xfer_experts):
             # Sync write for expert e, submit write for expert e+1
@@ -411,22 +413,33 @@ class SharedFullContext:
                     if e > 0:
                         events[e - 1].synchronize()
 
-                    submit_write_expert(e + 1, wrapper.topk_idx[e + 1])
+                    submit_write_expert(e + 1, self.topk_idx[e + 1])
+
+            if tp_rank == 0:
+                gate_type, down_type = wrapper.gate_type, wrapper.down_type
+            else:
+                gate_type, down_type = None, None
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
                 dist.barrier(group=get_tp_group().device_group)
+                # rank 0 broadcast the quant_type for this expert
+                type_list = [gate_type, down_type]
+                dist.broadcast_object_list(
+                    type_list, src=0, group=get_tp_group().cpu_group
+                )
+                gate_type, down_type = type_list[0], type_list[1]
 
             with torch.cuda.stream(copy_stream):
                 slot = e % 2  # Double buffering
-                for i, (cpu_buf, gpu_t, gpu_tmp_buf) in enumerate(weight_infos):
+                for i, (cpu_buf, gpu_t, gpu_buf) in enumerate(weight_infos):
                     name = self.WEIGHT_NAMES[i]
-                    gpu_tmp_buf.copy_(cpu_buf[slot], non_blocking=True)
-                    if gpu_t[wrapper.topk_idx[e]].is_contiguous() and gpu_tmp_buf.is_contiguous():
+                    gpu_buf.copy_(cpu_buf[slot], non_blocking=True)
+                    if gpu_t[self.topk_idx[e]].is_contiguous() and gpu_buf.is_contiguous():
                         if name == 'w13_weight':
-                            quant_type = wrapper.gate_type
+                            quant_type = gate_type
                         else:
-                            quant_type = wrapper.down_type
+                            quant_type = down_type
 
                         ele_per_blk, size_per_blk = GGML_QUANT_SIZES[quant_type]
                         dequant_fn = None
@@ -438,15 +451,15 @@ class SharedFullContext:
                             raise ValueError(f"Unsupported quantization type: {quant_type}")
 
                         dequant_fn(
-                            gpu_tmp_buf.data_ptr(),
-                            gpu_t[wrapper.topk_idx[e]].data_ptr(),
-                            gpu_t[wrapper.topk_idx[e]].numel() * size_per_blk // ele_per_blk,
+                            gpu_buf.data_ptr(),
+                            gpu_t[self.topk_idx[e]].data_ptr(),
+                            gpu_t[self.topk_idx[e]].numel() * size_per_blk // ele_per_blk,
                             size_per_blk,
                             ele_per_blk,
                             torch.float16,
                         )
                     else:
-                        logger.error(f'gpu[{e}] or gpu_tmp_buf is not contiguous in memory')
+                        logger.error(f'gpu[{e}] or gpu_buf is not contiguous in memory')
 
                 events[e].record(copy_stream)
 
@@ -722,7 +735,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ):
             expert_ids_cnt = torch.bincount(expert_ids.view(-1))
 
-            topk_idx = torch.topk(expert_ids_cnt, k=min(30, expert_ids_cnt.size(0))).indices
+            topk_idx = torch.topk(expert_ids_cnt, k=min(20, expert_ids_cnt.size(0))).indices
             topk_mask = torch.isin(expert_ids, topk_idx)
 
             gpu_expert_ids = mask_expert_ids_selected(gpu_expert_ids, topk_mask, is_gpu=True)
@@ -743,29 +756,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 3: Execute GPU expert computation (any quantization method)
         # This runs in parallel with CPU computation
         if topk_idx is not None:
-            self.wrapper.topk_idx = topk_idx
-            ctx = self._build_full_context(layer)
-            gpu_combine_input = ctx.gpu_method.apply(
-                ctx.gpu_layer,
-                x=x,
-                topk_output=gpu_topk_output,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                inplace=inplace,
-                no_combine=no_combine,
-                routed_scaling_factor=routed_scaling_factor,
-            )
+            ctx = self._build_full_context(layer, topk_idx)
+            _layer = ctx.gpu_layer
+            _gpu_method = ctx.gpu_method
         else:
-            gpu_combine_input = self.gpu_method.apply(
-                layer=layer,
-                x=x,
-                topk_output=gpu_topk_output,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                inplace=inplace,
-                no_combine=no_combine,
-                routed_scaling_factor=routed_scaling_factor,
-            )
+            _layer = layer
+            _gpu_method = self.gpu_method
+
+        gpu_combine_input = _gpu_method.apply(
+            layer=_layer,
+            x=x,
+            topk_output=gpu_topk_output,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=inplace,
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
         # Step 4: Synchronize CPU results and merge with GPU results
         output = gpu_combine_input
@@ -795,7 +802,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return getattr(self.gpu_method, name)
 
-    def _build_full_context(self, layer: torch.nn.Module) -> "SharedFullContext":
+    def _build_full_context(self, layer: torch.nn.Module, topk_idx: torch.Tensor) -> "SharedFullContext":
         global _SHARED_FULL_CONTEXT
 
         if _SHARED_FULL_CONTEXT is None:
@@ -805,6 +812,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 global_num_experts=self.global_num_experts,
             )
 
+        _SHARED_FULL_CONTEXT.topk_idx = topk_idx
         _SHARED_FULL_CONTEXT.load(
             layer_idx=self.kt_config.layer_idx,
             wrapper=self.wrapper,
