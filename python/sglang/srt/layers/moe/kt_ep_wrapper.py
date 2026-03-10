@@ -402,6 +402,17 @@ class SharedFullContext:
             # Submit expert 0 ahead of time
             submit_write_expert(0, self.topk_idx[0])
 
+        if tp_rank == 0:
+            gate_type, down_type = wrapper.gate_type, wrapper.down_type
+        else:
+            gate_type, down_type = None, None
+        if dist.is_initialized():
+            type_list = [gate_type, down_type]
+            dist.broadcast_object_list(
+                type_list, src=0, group=get_tp_group().cpu_group
+            )
+            gate_type, down_type = type_list[0], type_list[1]
+
         for e in range(nr_xfer_experts):
             # Sync write for expert e, submit write for expert e+1
             if do_write:
@@ -415,20 +426,9 @@ class SharedFullContext:
 
                     submit_write_expert(e + 1, self.topk_idx[e + 1])
 
-            if tp_rank == 0:
-                gate_type, down_type = wrapper.gate_type, wrapper.down_type
-            else:
-                gate_type, down_type = None, None
-
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
                 dist.barrier(group=get_tp_group().device_group)
-                # rank 0 broadcast the quant_type for this expert
-                type_list = [gate_type, down_type]
-                dist.broadcast_object_list(
-                    type_list, src=0, group=get_tp_group().cpu_group
-                )
-                gate_type, down_type = type_list[0], type_list[1]
 
             with torch.cuda.stream(copy_stream):
                 slot = e % 2  # Double buffering
@@ -462,12 +462,6 @@ class SharedFullContext:
                         logger.error(f'gpu[{e}] or gpu_buf is not contiguous in memory')
 
                 events[e].record(copy_stream)
-
-            # Postprocess expert e-1: provides pipeline structure for future extensions
-            if e > 0:
-                with torch.cuda.stream(post_stream):
-                    post_stream.wait_event(events[e - 1])
-                    postprocess_expert(e - 1)
 
         # Process last expert
         with torch.cuda.stream(post_stream):
@@ -697,6 +691,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             x, torch.cuda.current_stream(x.device).cuda_stream
         )
 
+    def filter_dispatch_tasks(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        cpu_expert_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Filter dispatch tasks to only include those assigned to CPU experts.
+
+        This method modifies the topk_output to set expert IDs that are not assigned
+        to CPU (IDs < num_gpu_experts) to -1, effectively filtering out GPU experts
+        from the CPU computation.
+
+        Args:
+            cpu_expert_ids: Tensor of shape [num_tokens, top_k] containing expert IDs
+
+        Returns:
+            Filtered expert IDs with GPU experts set to -1
+        """
+        topk_weights, _, _ = topk_output
+
+        self.wrapper.dispatch_tasks(
+            hidden_states,
+            cpu_expert_ids,
+            topk_weights,
+            torch.cuda.current_stream(hidden_states.device).cuda_stream)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -727,42 +747,45 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         expert_ids = topk_output.topk_ids
         gpu_expert_ids: torch.Tensor = expert_ids.clone()
         cpu_expert_ids: torch.Tensor = expert_ids.clone()
-        topk_idx: torch.Tensor = None
-        
+        layerwise_prefill: bool = False
+
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
         ):
             expert_ids_cnt = torch.bincount(expert_ids.view(-1))
 
-            topk_idx = torch.topk(expert_ids_cnt, k=min(20, expert_ids_cnt.size(0))).indices
+            topk_idx = torch.topk(expert_ids_cnt, k=min(40, expert_ids_cnt.size(0))).indices
             topk_mask = torch.isin(expert_ids, topk_idx)
 
             gpu_expert_ids = mask_expert_ids_selected(gpu_expert_ids, topk_mask, is_gpu=True)
             cpu_expert_ids = mask_expert_ids_selected(cpu_expert_ids, topk_mask, is_gpu=False)
+            layerwise_prefill = True
         else:
             gpu_expert_ids = mask_cpu_expert_ids(gpu_expert_ids, self.num_gpu_experts, is_gpu=True)
             cpu_expert_ids = mask_cpu_expert_ids(cpu_expert_ids, self.num_gpu_experts, is_gpu=False)
+            _layer = layer
+            _gpu_method = self.gpu_method
+        
+        # Step 0: Dispatch CPU expert computation to remote nodes
+        if self.tp_rank == 0:
+            self.filter_dispatch_tasks(x, topk_output, cpu_expert_ids)
 
-        cpu_topk_output = topk_output._replace(topk_ids=cpu_expert_ids)
+        if layerwise_prefill:
+            ctx = self._build_full_context(layer, topk_idx)
+            _layer = ctx.gpu_layer
+            _gpu_method = ctx.gpu_method
+
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
-            self.submit(x, cpu_topk_output)
+            self.submit(x, topk_output)
 
         # Step 2: Prepare GPU computation by masking CPU expert IDs
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
         gpu_topk_output = topk_output._replace(topk_ids=gpu_expert_ids)
-        
+
         # Step 3: Execute GPU expert computation (any quantization method)
         # This runs in parallel with CPU computation
-        if topk_idx is not None:
-            ctx = self._build_full_context(layer, topk_idx)
-            _layer = ctx.gpu_layer
-            _gpu_method = ctx.gpu_method
-        else:
-            _layer = layer
-            _gpu_method = self.gpu_method
-
         gpu_combine_input = _gpu_method.apply(
             layer=_layer,
             x=x,
