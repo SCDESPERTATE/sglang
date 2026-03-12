@@ -244,11 +244,7 @@ class SharedFullContext:
         else:
             self.shm_unique_id = None
         if dist.is_initialized():
-            unique_id_list = [self.shm_unique_id]
-            dist.broadcast_object_list(
-                unique_id_list, src=0, group=get_tp_group().cpu_group
-            )
-            self.shm_unique_id = unique_id_list[0]
+            self.shm_unique_id = get_tp_group().broadcast_object(self.shm_unique_id)
 
         for name in self.weight_names:
             gpu_tensor = getattr(self.gpu_layer, name)
@@ -281,14 +277,14 @@ class SharedFullContext:
             self.gpu_buffers[name] = torch.empty(expert_nbytes, dtype=cpu_buffer.dtype, device=gpu_tensor.device)
 
         if dist.is_initialized():
-            dist.barrier(group=get_tp_group().device_group)
+            get_tp_group().barrier()
 
         self.all_rank_buffer_ptrs = self._collect_all_rank_buffer_pointers()
 
         # Unlink shared memory after all ranks have collected pointers.
         # The memory remains accessible as long as we hold references via mmap.
         if dist.is_initialized():
-            dist.barrier(group=get_tp_group().device_group)
+            get_tp_group().barrier()
         for shm in self.shm_handles.values():
             shm.unlink()
 
@@ -428,38 +424,35 @@ class SharedFullContext:
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
+                get_tp_group().barrier()
 
             with torch.cuda.stream(copy_stream):
                 slot = e % 2  # Double buffering
                 for i, (cpu_buf, gpu_t, gpu_buf) in enumerate(weight_infos):
                     name = self.WEIGHT_NAMES[i]
                     gpu_buf.copy_(cpu_buf[slot], non_blocking=True)
-                    if gpu_t[self.topk_idx[e]].is_contiguous() and gpu_buf.is_contiguous():
-                        if name == 'w13_weight':
-                            quant_type = gate_type
-                        else:
-                            quant_type = down_type
-
-                        ele_per_blk, size_per_blk = GGML_QUANT_SIZES[quant_type]
-                        dequant_fn = None
-                        if quant_type == GGMLQuantizationType.Q6_K:
-                            dequant_fn = KTransformersOps.dequantize_q6_k
-                        elif quant_type == GGMLQuantizationType.Q4_K:
-                            dequant_fn = KTransformersOps.dequantize_q4_k
-                        else:
-                            raise ValueError(f"Unsupported quantization type: {quant_type}")
-
-                        dequant_fn(
-                            gpu_buf.data_ptr(),
-                            gpu_t[self.topk_idx[e]].data_ptr(),
-                            gpu_t[self.topk_idx[e]].numel() * size_per_blk // ele_per_blk,
-                            size_per_blk,
-                            ele_per_blk,
-                            torch.float16,
-                        )
+                    if name == 'w13_weight':
+                        quant_type = gate_type
                     else:
-                        logger.error(f'gpu[{e}] or gpu_buf is not contiguous in memory')
+                        quant_type = down_type
+
+                    ele_per_blk, size_per_blk = GGML_QUANT_SIZES[quant_type]
+                    dequant_fn = None
+                    if quant_type == GGMLQuantizationType.Q6_K:
+                        dequant_fn = KTransformersOps.dequantize_q6_k
+                    elif quant_type == GGMLQuantizationType.Q4_K:
+                        dequant_fn = KTransformersOps.dequantize_q4_k
+                    else:
+                        raise ValueError(f"Unsupported quantization type: {quant_type}")
+
+                    dequant_fn(
+                        gpu_buf.data_ptr(),
+                        gpu_t[self.topk_idx[e]].data_ptr(),
+                        gpu_t[self.topk_idx[e]].numel() * size_per_blk // ele_per_blk,
+                        size_per_blk,
+                        ele_per_blk,
+                        torch.float16,
+                    )
 
                 events[e].record(copy_stream)
 
@@ -755,7 +748,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ):
             expert_ids_cnt = torch.bincount(expert_ids.view(-1))
 
-            topk_idx = torch.topk(expert_ids_cnt, k=min(40, expert_ids_cnt.size(0))).indices
+            topk_idx = torch.topk(expert_ids_cnt, k=min(20, expert_ids_cnt.size(0))).indices
             topk_mask = torch.isin(expert_ids, topk_idx)
 
             gpu_expert_ids = mask_expert_ids_selected(gpu_expert_ids, topk_mask, is_gpu=True)
