@@ -430,7 +430,7 @@ class SharedFullContext:
                 slot = e % 2  # Double buffering
                 for i, (cpu_buf, gpu_t, gpu_buf) in enumerate(weight_infos):
                     name = self.WEIGHT_NAMES[i]
-                    gpu_buf.copy_(cpu_buf[slot], non_blocking=True)
+                    gpu_buf.copy_(cpu_buf[slot])
                     if name == 'w13_weight':
                         quant_type = gate_type
                     else:
@@ -828,7 +828,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 global_num_experts=self.global_num_experts,
             )
 
-        _SHARED_FULL_CONTEXT.topk_idx = topk_idx
+        _SHARED_FULL_CONTEXT.topk_idx = topk_idx.cpu()
         _SHARED_FULL_CONTEXT.load(
             layer_idx=self.kt_config.layer_idx,
             wrapper=self.wrapper,
